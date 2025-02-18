@@ -16,6 +16,7 @@ if t.TYPE_CHECKING:
     from ragas.embeddings import BaseRagasEmbeddings
     from ragas.evaluation import EvaluationResult
     from ragas.metrics.base import Metric
+    from r2r import R2RAsyncClient
 
 
 logger = logging.getLogger(__name__)
@@ -57,10 +58,14 @@ def _process_search_results(search_results: t.Dict[str, t.List]) -> t.List[str]:
 
 
 def evaluate(
-    r2r_client,
-    search_settings: t.Dist[str, t.Any],
+    r2r_client: R2RAsyncClient,
     dataset: EvaluationDataset,
     metrics: list[Metric],
+    search_settings: t.Optional[t.Dict[str, t.Any]] = None,
+    rag_generation_config: t.Optional[t.Dict[str,]] = None,
+    search_mode: t.Optional[str] = "custom",
+    task_prompt_override: t.Optional[str] = None,
+    include_title_if_available: t.Optional[bool] = False,
     llm: t.Optional[BaseRagasLLM] = None,
     embeddings: t.Optional[BaseRagasEmbeddings] = None,
     callbacks: t.Optional[Callbacks] = None,
@@ -96,11 +101,14 @@ def evaluate(
     # get query and make jobs
     queries = [sample.user_input for sample in samples]
     for i, q in enumerate(queries):
-        # TODO: pass other args
         exec.submit(
             r2r_client.retrieval.rag,
             query=q,
+            rag_generation_config=rag_generation_config,
+            search_mode=search_mode,
             search_settings=search_settings,
+            task_prompt_override=task_prompt_override,
+            include_title_if_available=include_title_if_available,
             name=f"query-{i}",
         )
 
@@ -133,3 +141,74 @@ def evaluate(
     )
 
     return results
+
+
+def transform_to_ragas_dataset(
+    user_inputs: t.Optional[t.List[str]] = None,
+    r2r_responses: t.Optional[t.List] = None,
+    reference_contexts: t.Optional[t.List[str]] = None,
+    references: t.Optional[t.List[str]] = None,
+    rubrics: t.Optional[t.List[t.Dict[str, str]]] = None,
+) -> EvaluationDataset:
+    """
+    Converts input data into a RAGAS EvaluationDataset, ensuring flexibility
+    for cases where only some lists are provided.
+
+    Parameters
+    ----------
+    user_inputs : Optional[List[str]]
+        List of user queries.
+    r2r_responses : Optional[List]
+        List of responses from the R2R client.
+    reference_contexts : Optional[List[str]]
+        List of reference contexts.
+    references : Optional[List[str]]
+        List of reference answers.
+    rubrics : Optional[List[Dict[str, str]]]
+        List of evaluation rubrics.
+
+    Returns
+    -------
+    EvaluationDataset
+        A dataset containing structured evaluation samples.
+
+    Raises
+    ------
+    ValueError
+        If provided lists (except None ones) do not have the same length.
+    """
+
+    # Collect only the non-None lists
+    provided_lists = {
+        "user_inputs": user_inputs or [],
+        "r2r_responses": r2r_responses or [],
+        "reference_contexts": reference_contexts or [],
+        "references": references or [],
+        "rubrics": rubrics or [],
+    }
+
+    # Find the maximum length among provided lists
+    max_len = max(len(lst) for lst in provided_lists.values())
+
+    # Ensure all provided lists have the same length
+    for key, lst in provided_lists.items():
+        if lst and len(lst) != max_len:
+            raise ValueError(f"Inconsistent length for {key}: expected {max_len}, got {len(lst)}")
+
+    # Create samples while handling missing values
+    samples = []
+    for i in range(max_len):
+        sample = SingleTurnSample(
+            user_input=user_inputs[i] if user_inputs else None,
+            response=(r2r_responses[i].results.generated_answer if r2r_responses else None),
+            retrieved_contexts=(
+                _process_search_results(r2r_responses[i].results.search_results.as_dict())
+                if r2r_responses else None
+            ),
+            reference_contexts=reference_contexts[i] if reference_contexts else None,
+            reference=references[i] if references else None,
+            rubric=rubrics[i] if rubrics else None,
+        )
+        samples.append(sample)
+
+    return EvaluationDataset(samples=samples)
